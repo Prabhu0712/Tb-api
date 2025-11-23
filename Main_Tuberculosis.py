@@ -1,86 +1,91 @@
-import os
-import numpy as np
+!pip install gradio --quiet
+
+import gradio as gr
 import tensorflow as tf
+import numpy as np
 import cv2
-from tensorflow.keras.preprocessing.image import ImageDataGenerator
-from tensorflow.keras.applications import EfficientNetB0, Xception
-from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Dense, GlobalAveragePooling2D, Input, Conv2D, MaxPooling2D, UpSampling2D, concatenate
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.callbacks import EarlyStopping
+from tensorflow.keras.models import load_model
 
-def unet_branch(input_tensor):
-    c1 = Conv2D(32, (3, 3), activation='relu', padding='same')(input_tensor)
-    p1 = MaxPooling2D((2, 2))(c1)
+# ---------------------------------------------
+# Load Model
+# ---------------------------------------------
+model_path = '/content/drive/My Drive/tb_ensemble_model.h5'
+model = load_model(model_path, compile=False)
 
-    c2 = Conv2D(64, (3, 3), activation='relu', padding='same')(p1)
-    p2 = MaxPooling2D((2, 2))(c2)
+# Class labels
+class_names = ['Normal', 'Tuberculosis']
 
-    c3 = Conv2D(128, (3, 3), activation='relu', padding='same')(p2)
-    p3 = MaxPooling2D((2, 2))(c3)
 
-    bn = Conv2D(256, (3, 3), activation='relu', padding='same')(p3)
+# ---------------------------------------------
+# Improved Grad-CAM Function
+# ---------------------------------------------
+def make_sharp_gradcam(model, img_array, conv_layer_name='block14_sepconv2_act'):
 
-    u1 = UpSampling2D((2, 2))(bn)
-    u1 = concatenate([u1, c3])
-    c4 = Conv2D(128, (3, 3), activation='relu', padding='same')(u1)
+    grad_model = tf.keras.models.Model(
+        inputs=[model.inputs],
+        outputs=[model.get_layer(conv_layer_name).output, model.output]
+    )
 
-    u2 = UpSampling2D((2, 2))(c4)
-    u2 = concatenate([u2, c2])
-    c5 = Conv2D(64, (3, 3), activation='relu', padding='same')(u2)
+    with tf.GradientTape() as tape:
+        conv_outputs, predictions = grad_model(img_array)
+        loss = predictions[:, 0]
 
-    u3 = UpSampling2D((2, 2))(c5)
-    u3 = concatenate([u3, c1])
-    c6 = Conv2D(32, (3, 3), activation='relu', padding='same')(u3)
+    grads = tape.gradient(loss, conv_outputs)[0]
+    pooled_grads = tf.reduce_mean(grads, axis=(0, 1))
+    conv_outputs = conv_outputs[0]
 
-    return GlobalAveragePooling2D()(c6)
-def build_ensemble_model(input_shape=(128, 128, 3)):
-    input_tensor = Input(shape=input_shape)
+    heatmap = tf.reduce_sum(conv_outputs * pooled_grads, axis=-1)
+    heatmap = np.maximum(heatmap, 0)
+    heatmap /= tf.math.reduce_max(heatmap) + 1e-8
 
-    # U-Net Branch
-    unet_features = unet_branch(input_tensor)
+    return heatmap.numpy()
 
-    # EfficientNetB0 Branch
-    eff_base = EfficientNetB0(include_top=False, weights='imagenet', input_tensor=input_tensor)
-    eff_features = GlobalAveragePooling2D()(eff_base.output)
 
-    # Xception Branch
-    xcp_base = Xception(include_top=False, weights='imagenet', input_tensor=input_tensor)
-    xcp_features = GlobalAveragePooling2D()(xcp_base.output)
+# ---------------------------------------------
+# Prediction Function for Gradio
+# ---------------------------------------------
+def predict_tb(image):
 
-    # Combine features
-    merged = concatenate([unet_features, eff_features, xcp_features])
-    output = Dense(1, activation='sigmoid')(merged)
+    orig_shape = image.shape[:2]  # (height, width)
 
-    model = Model(inputs=input_tensor, outputs=output, name='TB_Ensemble_Model')
-    model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
-    return model
-data_path = '/content/drive/My Drive/Dataset/TB_Chest_Radiography_Database'
+    img_resized = cv2.resize(image, (128, 128))
+    img_input = img_resized.astype("float32") / 255.0
+    img_array = np.expand_dims(img_input, axis=0)
 
-datagen = ImageDataGenerator(
-    rescale=1./255,
-    validation_split=0.2
+    # Prediction
+    prob = model.predict(img_array)[0][0]
+    label = class_names[int(prob > 0.5)]
+    confidence = prob if label == "Tuberculosis" else 1 - prob
+
+    # Grad-CAM heatmap
+    heatmap = make_sharp_gradcam(model, img_array)
+    heatmap_resized = cv2.resize(heatmap, (orig_shape[1], orig_shape[0]))
+    heatmap_color = cv2.applyColorMap(np.uint8(255 * heatmap_resized), cv2.COLORMAP_JET)
+
+    overlay = cv2.addWeighted(
+        cv2.cvtColor(image, cv2.COLOR_BGR2RGB),
+        0.6,
+        heatmap_color,
+        0.4,
+        0
+    )
+
+    return label, round(confidence * 100, 2), overlay
+
+
+# ---------------------------------------------
+# Gradio Interface
+# ---------------------------------------------
+interface = gr.Interface(
+    fn=predict_tb,
+    inputs=gr.Image(type="numpy", label="Upload Chest X-Ray"),
+    outputs=[
+        gr.Label(label="Prediction"),
+        gr.Number(label="Confidence (%)"),
+        gr.Image(label="Grad-CAM Heatmap")
+    ],
+    title="Tuberculosis Detection from Chest X-Rays",
+    description="Upload a chest X-ray image to detect Tuberculosis using an ensemble deep learning model with Grad-CAM explainability."
 )
 
-train_generator = datagen.flow_from_directory(
-    data_path,
-    target_size=(128, 128),
-    batch_size=32,
-    class_mode='binary',
-    subset='training'
-)
-
-validation_generator = datagen.flow_from_directory(
-    data_path,
-    target_size=(128, 128),
-    batch_size=32,
-    class_mode='binary',
-    subset='validation'
-)
-model = build_ensemble_model()
-
-history = model.fit(
-    train_generator,
-    validation_data=validation_generator,
-    epochs=20
-)
+interface.launch(share=True)
